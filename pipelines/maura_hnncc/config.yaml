@@ -1,0 +1,27 @@
+label_column: HPV_validated.fest.GES
+metadata_csv: /workspaces/tcr_structure_embedding/data/maura_hnncc/meta_label_sep4_hpv_specific_with_wholevdj.csv
+metadata_encoding: latin1
+id_column: tcr_id
+
+feature_sets:
+  struct:
+    - /workspaces/tcr_structure_embedding/outputs/maura_hnncc/features/maura_hnncc_struct_features.csv
+  inter:
+    - /workspaces/tcr_structure_embedding/outputs/maura_hnncc/features/maura_hnncc_interface_analyzer.csv
+  res:
+    - /workspaces/tcr_structure_embedding/outputs/maura_hnncc/features/maura_hnncc_residue_energy_cdr.csv
+  struct_inter:
+    - /workspaces/tcr_structure_embedding/outputs/maura_hnncc/features/maura_hnncc_struct_features.csv
+    - /workspaces/tcr_structure_embedding/outputs/maura_hnncc/features/maura_hnncc_interface_analyzer.csv
+  struct_res:
+    - /workspaces/tcr_structure_embedding/outputs/maura_hnncc/features/maura_hnncc_struct_features.csv
+    - /workspaces/tcr_structure_embedding/outputs/maura_hnncc/features/maura_hnncc_residue_energy_cdr.csv
+  inter_res:
+    - /workspaces/tcr_structure_embedding/outputs/maura_hnncc/features/maura_hnncc_interface_analyzer.csv
+    - /workspaces/tcr_structure_embedding/outputs/maura_hnncc/features/maura_hnncc_residue_energy_cdr.csv
+  struct_inter_res:
+    - /workspaces/tcr_structure_embedding/outputs/maura_hnncc/features/maura_hnncc_struct_features.csv
+    - /workspaces/tcr_structure_embedding/outputs/maura_hnncc/features/maura_hnncc_interface_analyzer.csv
+    - /workspaces/tcr_structure_embedding/outputs/maura_hnncc/features/maura_hnncc_residue_energy_cdr.csv
+
+models: ["xgboost", "logreg", "random_forest"]
