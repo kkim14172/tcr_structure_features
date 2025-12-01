@@ -1,0 +1,24 @@
+#!/bin/bash 
+#BSUB -n 1
+#BSUB -M 5
+#BSUB -W 12:00
+#BSUB -q gpu
+#BSUB -o experiments/%J.out
+#BSUB -e experiments/%J.err
+#BSUB -J mhc1test4
+
+module load miniforge3
+eval "$(/risapps/rhel8/miniforge3/24.5.0-0/bin/conda shell.bash hook)"
+conda init && conda activate tcrmodel2
+
+cd $HOME/programs
+python3 tcrmodel2/run_tcrmodel2.py \
+--job_id=tcr168 \
+--output_dir=/rsrch3/scratch/genomic_med/kkim14/data/khaled_killing/tcrmodel2_out \
+--tcra_seq=MLLEHLLIILWMQLTWVSGQQLNQSPQSMFIQEGEDVSMNCTSSSIFNTWLWYKQDPGEGPVLLIALYKAGELTSNGRLTAQFGITRKDSFLNISASIPSDVGIYFCAGRGRSNFGNEKLTFGTGTRLTIIPNIQNPDPAVYQLRD \
+--tcrb_seq=MGSRLLCWVLLCLLGAGPVKAGVTQTPRYLIKTRGQQVTLSCSPISGHRSVSWYQQTPGQGLQFLFEYFSETQRNKGNFPGRFSGRQFSNSRSEMNVSTLELGDSALYLCASSLDLFYGYTFGSGTRLTVVEDLNKVFPPEVAVFEPS \
+--pep_seq=MHGDTPTLH \
+--mhca_seq=GSHSMRYFYTSVSRPGRGEPRFISVGYVDDTQFVRFDSDAASPREEPRAPWIEQEGPEYWDRNTQICKTNTQTDRESLRNLRGYYNQSEAGSHTLQRMYGCDVGPDGRLLRGHNQFAYDGKDYIALNEDLSSWTAADTAAQITQRKWEAARVAEQLRTYLEGTCVEWLRRYLENGKETLQ \
+--tp_db=$HOME/programs/tcrmodel2/data/databases \
+--ori_db=/rsrch3/scratch/reflib/REFLIB_data/alphafold-2.3.1 \
+--relax_structures=True
