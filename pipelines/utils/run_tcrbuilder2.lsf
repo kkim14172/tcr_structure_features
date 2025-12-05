@@ -1,0 +1,33 @@
+#!/bin/bash 
+#BSUB -n 1
+#BSUB -M 5
+#BSUB -W 12:00
+#BSUB -q egpu
+#BSUB -R rusage[mem=5G]
+#BSUB -o /rsrch3/scratch/genomic_med/kkim14/data/maura_hnncc/Qing/tcrbuilder2_out/logs/%J.out
+#BSUB -e /rsrch3/scratch/genomic_med/kkim14/data/maura_hnncc/Qing/tcrbuilder2_out/logs/%J.err
+#BSUB -J hnncc_0
+
+set -e
+echo "Job started at: $(date)"
+echo "Host: $(hostname)"
+echo "Running in directory: $(pwd)"
+
+module load miniforge3
+eval "$(/risapps/rhel8/miniforge3/24.5.0-0/bin/conda shell.bash hook)"
+conda init && conda activate ImmuneBuilder
+
+python -c "import torch; print('CUDA available:', torch.cuda.is_available(), 'CUDA version:', torch.version.cuda)"
+
+CSV=/rsrch3/scratch/genomic_med/kkim14/data/maura_hnncc/Qing/raw/seq_0.csv
+OUTDIR=/rsrch3/scratch/genomic_med/kkim14/data/maura_hnncc/Qing/tcrbuilder2_out
+
+cd /home/kkim14/programs/
+python run_tcrbuilder2.py \
+  --csv "$CSV" \
+  --csv_id_col id \
+  --csv_a_col tra_aa \
+  --csv_b_col trb_bb \
+  --output_dir "$OUTDIR"
+
+echo "Job finished at: $(date)"
