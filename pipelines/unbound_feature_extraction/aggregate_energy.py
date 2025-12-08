@@ -3,7 +3,6 @@
 Input: residue_energy_breakdown.out (Rosetta application output)
 Output: CSV with summed energies per (tcr_id, chain, region) where region ∈ {cdr1,cdr2,cdr3,framework}
 """
-from __future__ import annotations
 import argparse
 import re
 import subprocess
@@ -15,6 +14,9 @@ import numpy as np
 import pandas as pd
 from Bio.PDB import PDBParser
 from Bio.SeqUtils import seq1
+
+import multiprocessing as mp  # <-- NEW
+
 
 # CDR ranges in IMGT numbering
 CDR_RANGES = {"cdr1": (25, 42), "cdr2": (58, 77), "cdr3": (107, 138)}
@@ -110,25 +112,35 @@ def _build_chain_maps(chain, use_anarci: bool, cache: Dict[str, Optional[List[Tu
     return resseq_to_cdr, resseq_to_idx
 
 
-def extract_chain(label: str) -> Tuple[Optional[int], Optional[str]]:
-    m = re.match(r"(-?\d+)([A-Za-z])", label)
-    if not m:
-        return None, None
-    return int(m.group(1)), m.group(2)
-
-
-def stream_aggregate(reb_path: Path, pdb_dir: Path, use_anarci: bool, max_poses: Optional[int] = None) -> pd.DataFrame:
+def _aggregate_pose(args) -> List[Dict[str, object]]:
     """
-    Stream through the residue energy breakdown file to avoid large memory usage.
-    Aggregates one-body energy terms for CDR loops (cdr1a, cdr2a, cdr3a, cdr1b, cdr2b, cdr3b)
-    and pairwise energy terms for predefined cross-chain CDR pairs.
-    One-body entries are identified by restype2 == "--" (Rosetta residue-energy breakdown "onebody").
+    Worker to aggregate energies for a single pose_id.
+
+    Args:
+        args: (pose_id, records, pdb_dir, use_anarci)
+
+    Returns:
+        List of row dicts: {"tcr_id", "region", "term", "value"}
     """
+    pose_id, records, pdb_dir, use_anarci = args
+
+    # local ANARCI cache per worker
     cache: Dict[str, Optional[List[Tuple[int, str, str]]]] = {}
-    chain_maps: Dict[str, Dict[str, Dict]] = {}
-    sums: Dict[Tuple[str, str, str], float] = defaultdict(float)
 
-    def region_label(pose_id: str, chain_id: Optional[str], resnum: Optional[int]) -> Optional[str]:
+    # Build chain_maps for this pose (A/B CDR maps)
+    chain_maps: Dict[str, Dict[str, Dict]] = {}
+    pdb_path = pdb_dir / pose_id
+    if pdb_path.exists():
+        structure = PDBParser(QUIET=True).get_structure("x", pdb_path)[0]
+        cmap: Dict[str, Dict[str, Dict]] = {}
+        for chain in structure:
+            resseq_to_cdr, _ = _build_chain_maps(chain, use_anarci=use_anarci, cache=cache)
+            cmap[chain.id] = {"cdr_map": resseq_to_cdr}
+        chain_maps[pose_id] = cmap
+    else:
+        chain_maps[pose_id] = {}
+
+    def region_label(chain_id: Optional[str], resnum: Optional[int]) -> Optional[str]:
         if pose_id not in chain_maps or chain_id is None or chain_id not in chain_maps[pose_id]:
             return None
         base = chain_maps[pose_id][chain_id]["cdr_map"].get(resnum, "framework")
@@ -139,9 +151,78 @@ def stream_aggregate(reb_path: Path, pdb_dir: Path, use_anarci: bool, max_poses:
             return None
         return f"{base}{suffix}"
 
+    sums: Dict[Tuple[str, str, str], float] = defaultdict(float)
+    energy_cols = ENERGY_TERMS
+
+    for rec in records:
+        restype2 = rec.get("restype2")
+        pdbid2 = rec.get("pdbid2")
+        is_onebody = (restype2 == "onebody") or (pdbid2 == "--")
+
+        if not is_onebody:
+            # pairwise energies
+            resnum1, chain1 = extract_chain(rec.get("pdbid1", ""))
+            resnum2, chain2 = extract_chain(rec.get("pdbid2", ""))
+            region1 = region_label(chain1, resnum1)
+            region2 = region_label(chain2, resnum2)
+            if not region1 or not region2:
+                continue
+            pair_key = f"{region1}-{region2}"
+            if pair_key not in PAIR_TARGETS:
+                pair_key = f"{region2}-{region1}"
+            if pair_key not in PAIR_TARGETS:
+                continue
+            for term in energy_cols:
+                try:
+                    val = float(rec.get(term, 0.0))
+                except Exception:
+                    val = 0.0
+                sums[(pose_id, pair_key, term)] += val
+        else:
+            # one-body energies
+            resnum, chain_id = extract_chain(rec.get("pdbid1", ""))
+            region = region_label(chain_id, resnum)
+            if not region:
+                continue
+            for term in energy_cols:
+                try:
+                    val = float(rec.get(term, 0.0))
+                except Exception:
+                    val = 0.0
+                sums[(pose_id, region, term)] += val
+
+    rows: List[Dict[str, object]] = []
+    for (pose, region, term), val in sums.items():
+        rows.append({"tcr_id": pose, "region": region, "term": term, "value": val})
+    return rows
+
+
+def extract_chain(label: str) -> Tuple[Optional[int], Optional[str]]:
+    m = re.match(r"(-?\d+)([A-Za-z])", label)
+    if not m:
+        return None, None
+    return int(m.group(1)), m.group(2)
+
+
+def stream_aggregate(
+    reb_path: Path,
+    pdb_dir: Path,
+    use_anarci: bool,
+    max_poses: Optional[int] = None,
+    n_procs: int = 1,
+) -> pd.DataFrame:
+    """
+    Aggregate residue energy breakdown into CDR/interaction energies.
+
+    Now uses a two-stage approach:
+      1) Parse residue_energy_breakdown.out into per-pose records.
+      2) Aggregate each pose in parallel with multiprocessing (if n_procs > 1).
+    """
+    # --- Stage 1: parse file into per-pose records ---
+    pose_records: Dict[str, List[Dict[str, str]]] = defaultdict(list)
+
     with reb_path.open("r") as f:
         header_line = None
-        energy_cols = ENERGY_TERMS
         for line in f:
             if not line.startswith("SCORE:"):
                 continue
@@ -149,69 +230,41 @@ def stream_aggregate(reb_path: Path, pdb_dir: Path, use_anarci: bool, max_poses:
             if header_line is None:
                 header_line = parts[1:]
                 continue
+            # skip header repeat lines
             if parts[1] == header_line[0]:
                 continue
             rec = dict(zip(header_line, parts[1:]))
             pose_id = rec.get("pose_id")
             if pose_id is None:
                 continue
+            pose_records[pose_id].append(rec)
 
-            if max_poses is not None and len(chain_maps) >= max_poses and pose_id not in chain_maps:
-                continue
-            if pose_id not in chain_maps:
-                pdb_path = pdb_dir / pose_id
-                if not pdb_path.exists():
-                    chain_maps[pose_id] = {}
-                else:
-                    structure = PDBParser(QUIET=True).get_structure("x", pdb_path)[0]
-                    cmap: Dict[str, Dict[str, Dict]] = {}
-                    for chain in structure:
-                        resseq_to_cdr, _ = _build_chain_maps(chain, use_anarci=use_anarci, cache=cache)
-                        cmap[chain.id] = {"cdr_map": resseq_to_cdr}
-                    chain_maps[pose_id] = cmap
-
-            restype2 = rec.get("restype2")
-            pdbid2 = rec.get("pdbid2")
-            is_onebody = (restype2 == "onebody") or (pdbid2 == "--")
-            if not is_onebody:
-                # pairwise energies
-                resnum1, chain1 = extract_chain(rec.get("pdbid1", ""))
-                resnum2, chain2 = extract_chain(rec.get("pdbid2", ""))
-                region1 = region_label(pose_id, chain1, resnum1)
-                region2 = region_label(pose_id, chain2, resnum2)
-                if not region1 or not region2:
-                    continue
-                pair_key = f"{region1}-{region2}"
-                if pair_key not in PAIR_TARGETS:
-                    pair_key = f"{region2}-{region1}"
-                if pair_key not in PAIR_TARGETS:
-                    continue
-                for term in energy_cols:
-                    try:
-                        val = float(rec.get(term, 0.0))
-                    except Exception:
-                        val = 0.0
-                    sums[(pose_id, pair_key, term)] += val
-            else:
-                # one-body energies
-                resnum, chain_id = extract_chain(rec.get("pdbid1", ""))
-                region = region_label(pose_id, chain_id, resnum)
-                if not region:
-                    continue
-                for term in energy_cols:
-                    try:
-                        val = float(rec.get(term, 0.0))
-                    except Exception:
-                        val = 0.0
-                    sums[(pose_id, region, term)] += val
-
-    if not sums:
+    if not pose_records:
         return pd.DataFrame()
 
-    rows = []
-    for (pose_id, region, term), val in sums.items():
-        rows.append({"tcr_id": pose_id, "region": region, "term": term, "value": val})
-    df_energy = pd.DataFrame(rows)
+    pose_ids = list(pose_records.keys())
+    if max_poses is not None:
+        pose_ids = pose_ids[:max_poses]
+
+    # --- Stage 2: aggregate per pose (optionally in parallel) ---
+    tasks = [(pid, pose_records[pid], pdb_dir, use_anarci) for pid in pose_ids]
+
+    all_rows: List[Dict[str, object]] = []
+
+    if n_procs is None or n_procs <= 1 or len(tasks) == 1:
+        # serial
+        for t in tasks:
+            all_rows.extend(_aggregate_pose(t))
+    else:
+        ctx = mp.get_context("spawn")
+        with ctx.Pool(processes=n_procs) as pool:
+            for rows in pool.imap_unordered(_aggregate_pose, tasks, chunksize=1):
+                all_rows.extend(rows)
+
+    if not all_rows:
+        return pd.DataFrame()
+
+    df_energy = pd.DataFrame(all_rows)
     df_energy["col"] = df_energy["region"] + "__" + df_energy["term"]
     pivot = df_energy.pivot_table(index="tcr_id", columns="col", values="value", fill_value=0).reset_index()
     return pivot
@@ -224,9 +277,21 @@ def main():
     parser.add_argument("--output", type=Path, default=Path("outputs/maura_hnncc/features/residue_energy_cdr.csv"))
     parser.add_argument("--use-anarci", action="store_true", help="Use ANARCI numbering (docker-based); otherwise use positional fallback.")
     parser.add_argument("--max-poses", type=int, default=None, help="Optional limit on number of pose_ids to process (for testing)")
+    parser.add_argument(
+        "--n-procs",
+        type=int,
+        default=1,
+        help="Number of worker processes for multiprocessing (default: 1 = serial)",
+    )
     args = parser.parse_args()
 
-    df_cdr = stream_aggregate(args.reb_file, args.pdb_dir, use_anarci=args.use_anarci, max_poses=args.max_poses)
+    df_cdr = stream_aggregate(
+        args.reb_file,
+        args.pdb_dir,
+        use_anarci=args.use_anarci,
+        max_poses=args.max_poses,
+        n_procs=args.n_procs,
+    )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     df_cdr.to_csv(args.output, index=False)
     print(f"Saved CDR energy table to {args.output} ({len(df_cdr)} rows)")

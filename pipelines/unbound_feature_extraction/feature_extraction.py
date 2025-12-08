@@ -10,6 +10,7 @@ import subprocess
 import re
 from pathlib import Path
 from typing import Dict, Iterable, Optional, Tuple, List
+import multiprocessing as mp  # <-- NEW
 
 import numpy as np
 import pandas as pd
@@ -219,7 +220,7 @@ def _sidechain_stretch(res_list: List) -> Tuple[float, float, float]:
         vals.append(d)
     if not vals:
         return np.nan, np.nan, np.nan
-    return float(np.max(vals)), float(np.mean(vals)), float(np.percentile(vals, 95))
+    return float(np.max(vals)), float(np.mean(vals)) #, float(np.percentile(vals, 95))
 
 
 # --- ANARCI helpers ---------------------------------------------------------
@@ -489,10 +490,10 @@ def _loop_features(chain, chain_label: str, domain_centroid: np.ndarray, sr: Shr
         })
 
         # side-chain reach in the middle of the loop
-        sc_max, sc_mean, sc_p95 = _sidechain_stretch(res_list)
+        sc_max, sc_mean = _sidechain_stretch(res_list) # removed sc_p95
         out[f"{chain_label}_{loop_name}_sidechain_mid_max"] = sc_max
         out[f"{chain_label}_{loop_name}_sidechain_mid_mean"] = sc_mean
-        out[f"{chain_label}_{loop_name}_sidechain_mid_p95"] = sc_p95
+        # out[f"{chain_label}_{loop_name}_sidechain_mid_p95"] = sc_p95
 
         out.update(_composition_features(seq, chain_label, loop_name))
 
@@ -530,6 +531,20 @@ def _loop_residue_lists(chain, chain_label: str, loop_keys: Optional[Dict[str, L
             loops[name] = _loop_residues(chain, res_range)
     return loops
 
+def _compute_single_pdb(args) -> Dict[str, object]:
+    """
+    Worker helper for multiprocessing: compute features for a single PDB.
+
+    args = (pdb_path, ref_info)
+    """
+    pdb_path, ref_info = args
+    tcr_id = pdb_path.stem
+    row: Dict[str, object] = {"tcr_id": tcr_id, "pdb_path": str(pdb_path)}
+    try:
+        row.update(compute_struct_features(pdb_path, ref_info=ref_info))
+    except Exception as exc:
+        row["error"] = str(exc)
+    return row
 
 # --- Metadata helpers -------------------------------------------------------
 
@@ -539,9 +554,16 @@ def load_config(config_path: Path) -> Dict:
 
 
 def load_metadata(csv_path: Path, encoding: str, id_column: str) -> pd.DataFrame:
-    df = pd.read_csv(csv_path, encoding=encoding)
-    df[id_column] = df[id_column].astype(str)
-    df = df.drop_duplicates(subset=id_column)
+    # If metadata CSV is not provided or doesn't exist, return empty dataframe
+    if not csv_path:
+        return pd.DataFrame(columns=[id_column])
+    p = Path(csv_path)
+    if not p.exists():
+        return pd.DataFrame(columns=[id_column])
+    df = pd.read_csv(p, encoding=encoding)
+    if id_column in df.columns:
+        df[id_column] = df[id_column].astype(str)
+        df = df.drop_duplicates(subset=id_column)
     return df
 
 
@@ -589,7 +611,12 @@ def prepare_reference(config: Dict) -> Optional[Dict[str, object]]:
 
 # --- Pipeline ---------------------------------------------------------------
 
-def build_feature_table(config: Dict, limit: Optional[int] = None, ref_info: Optional[Dict[str, object]] = None) -> pd.DataFrame:
+def build_feature_table(
+    config: Dict,
+    limit: Optional[int] = None,
+    ref_info: Optional[Dict[str, object]] = None,
+    n_procs: int = 1,
+) -> pd.DataFrame:
     pdb_dir = Path(config["raw_pdb_dir"])
     metadata_csv = Path(config["metadata_csv"])
     id_col = config["id_column"]
@@ -598,52 +625,102 @@ def build_feature_table(config: Dict, limit: Optional[int] = None, ref_info: Opt
     meta = load_metadata(metadata_csv, config.get("metadata_encoding", "utf-8"), id_col)
     meta[id_col] = meta[id_col].str.replace(".pdb", "", regex=False)
 
-    records = []
-    for i, pdb_path in enumerate(sorted(pdb_dir.glob("*.pdb"))):
-        if limit is not None and i >= limit:
-            break
-        tcr_id = pdb_path.stem
-        row: Dict[str, object] = {"tcr_id": tcr_id, "pdb_path": str(pdb_path)}
-        try:
-            row.update(compute_struct_features(pdb_path, ref_info=ref_info))
-        except Exception as exc:  # keep going even if a structure fails
-            row.update({"error": str(exc)})
-        meta_row = meta.loc[meta[id_col] == tcr_id]
-        if not meta_row.empty:
-            for col in meta_cols:
-                if col in meta_row.columns:
-                    row[col] = meta_row.iloc[0][col]
-        records.append(row)
+    # Collect PDB paths
+    pdb_paths = sorted(pdb_dir.glob("*.pdb"))
+    if limit is not None:
+        pdb_paths = pdb_paths[:limit]
+
+    records: List[Dict[str, object]] = []
+
+    if n_procs is None or n_procs <= 1 or len(pdb_paths) <= 1:
+        # Serial path
+        for pdb_path in pdb_paths:
+            tcr_id = pdb_path.stem
+            row: Dict[str, object] = {"tcr_id": tcr_id, "pdb_path": str(pdb_path)}
+            try:
+                row.update(compute_struct_features(pdb_path, ref_info=ref_info))
+            except Exception as exc:
+                row["error"] = str(exc)
+            records.append(row)
+    else:
+        # Parallel path
+        # Note: ref_info will be pickled and sent to each worker once.
+        # Use spawn context for safety on macOS.
+        ctx = mp.get_context("spawn")
+        with ctx.Pool(processes=n_procs) as pool:
+            for row in pool.imap_unordered(
+                _compute_single_pdb,
+                [(p, ref_info) for p in pdb_paths],
+                chunksize=1,
+            ):
+                records.append(row)
 
     df = pd.DataFrame.from_records(records)
+
+    # Merge metadata in one shot
+    if not meta.empty:
+        cols_to_use = [id_col] + [c for c in meta_cols if c in meta.columns]
+        meta_sub = meta[cols_to_use].drop_duplicates(subset=id_col)
+        df = df.merge(meta_sub, left_on="tcr_id", right_on=id_col, how="left")
+
     return df
 
-
 def save_outputs(df: pd.DataFrame, config: Dict) -> None:
-    feature_path = Path(config["output_feature_table"])
     csv_path = Path(config["output_dataset_csv"])
-    feature_path.parent.mkdir(parents=True, exist_ok=True)
     csv_path.parent.mkdir(parents=True, exist_ok=True)
-    df.to_parquet(feature_path, index=False)
     df.to_csv(csv_path, index=False)
 
 
 def main(args: Optional[Iterable[str]] = None) -> None:
     parser = argparse.ArgumentParser(description="Extract structural features for maura_hnncc dataset")
-    parser.add_argument("--config", type=Path, default=Path(__file__).with_name("config.yaml"), help="Path to YAML config")
+    parser.add_argument("--config", type=Path, default=None, help="Path to YAML config (optional)")
+    parser.add_argument("--raw-pdb-dir", type=Path, default=None, help="Directory with raw PDB files (overrides config)")
+    parser.add_argument("--metadata-csv", type=Path, default=None, help="Path to metadata CSV (overrides config)")
+    parser.add_argument("--id-column", type=str, default="tcr_id", help="ID column name in metadata CSV (overrides config)")
+    parser.add_argument("--output-dataset-csv", type=Path, default=None, help="Output CSV path for dataset (overrides config)")
+    parser.add_argument("--feature-columns", type=str, default=None, help="Comma-separated feature columns to pull from metadata (overrides config)")
+    parser.add_argument("--metadata-encoding", type=str, default="utf-8", help="Encoding used when reading metadata CSV")
+    parser.add_argument("--reference-pdb", type=Path, default=None, help="Reference PDB path (overrides config)")
     parser.add_argument("--dry-run", action="store_true", help="Print a preview instead of writing files")
     parser.add_argument("--limit", type=int, default=None, help="Optional number of PDBs to process (for quick tests)")
+    parser.add_argument(
+        "--n-procs",
+        type=int,
+        default=1,
+        help="Number of worker processes for multiprocessing (default: 1 = no multiprocessing)",
+    )
     parsed = parser.parse_args(args)
 
-    cfg = load_config(parsed.config)
+    # Load config if provided and exists; otherwise build config from CLI args with sensible defaults
+    if parsed.config is not None and parsed.config.exists():
+        cfg = load_config(parsed.config)
+    else:
+        cfg = {}
+        cfg["raw_pdb_dir"] = str(parsed.raw_pdb_dir) if parsed.raw_pdb_dir is not None else str(Path.cwd())
+        cfg["metadata_csv"] = str(parsed.metadata_csv) if parsed.metadata_csv is not None else ""
+        cfg["id_column"] = parsed.id_column or "tcr_id"
+        cfg["output_dataset_csv"] = str(parsed.output_dataset_csv) if parsed.output_dataset_csv is not None else str(Path.cwd() / "dataset.csv")
+        cfg["feature_columns"] = [c for c in parsed.feature_columns.split(",")] if parsed.feature_columns else []
+        cfg["metadata_encoding"] = parsed.metadata_encoding or "utf-8"
+        if parsed.reference_pdb is not None:
+            cfg["reference_pdb"] = str(parsed.reference_pdb)
+
     ref_info = prepare_reference(cfg)
-    df = build_feature_table(cfg, limit=parsed.limit, ref_info=ref_info)
+
+    df = build_feature_table(
+        cfg,
+        limit=parsed.limit,
+        ref_info=ref_info,
+        n_procs=parsed.n_procs,
+    )
+
     if parsed.dry_run:
         print(df.head())
         print(f"Rows: {len(df)}")
         return
+
     save_outputs(df, cfg)
-    print(f"Saved features to {cfg['output_feature_table']} and {cfg['output_dataset_csv']}")
+    print(f"Saved dataset to {cfg['output_dataset_csv']}")
 
 
 if __name__ == "__main__":
